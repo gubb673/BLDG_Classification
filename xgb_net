@@ -1,0 +1,137 @@
+import pandas as pd
+import glob
+import pickle
+import os
+import xgboost as xgb
+
+import numpy as np
+from google.colab import data_table
+from sklearn.utils.class_weight import compute_sample_weight
+from sklearn import preprocessing
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_curve, auc, roc_auc_score
+from sklearn.metrics import precision_score
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import OrdinalEncoder
+from sklearn.metrics import confusion_matrix
+import scipy
+
+train_feather = 'train.feather'
+class_meta = 'class_meta.xlsx'
+pred_res = 'pred_res.feather'
+confusion_matrix_output = 'cf_new_class_new_bind_paper_class.xlsx'
+acc_performance_output = 'cf_new_class_new_bind_paper_class_f1_recall_prec.xlsx'
+feature_name_meta = 'fea_importance_shortname.xlsx'
+feature_importance_output = 'fea_importance_output.xlsx'
+model_ouptut = 'xgb_paper_val.p'
+sub_class_field = 'sub_class'
+type_key = 'paper_extended_class'
+type_key = 'paper_class'
+
+big_fea = pd.read_feather(train_feather)
+class_meta = pd.read_excel(class_meta)
+
+X_name = set(list(big_fea.columns)) - set(
+    ['BLDG_USAGE', 'BLDG_USAGE_s', 'Label', 'BLDG_NO', 'BLDG_USAGE_s', 'BLDG_USAGE_s_code'])
+big_fea = pd.merge(big_fea, class_meta, left_on='BLDG_USAGE_s', right_on=sub_class_field)
+
+p_data = big_fea[type_key].value_counts()  # counts occurrence of each value
+entropy = scipy.stats.entropy(p_data) / np.log(p_data.shape[0])
+
+print(entropy)
+
+# print(scipy.stats.entropy(big_fea[type_key]))
+# type_key = 'BLDG_USAGE_s'
+enc = OrdinalEncoder()
+enc.fit(big_fea[type_key].values.reshape((-1, 1)))
+big_fea['BLDG_USAGE_s_code'] = enc.fit_transform(big_fea[type_key].values.reshape((-1, 1)))
+Y_name = 'BLDG_USAGE_s_code'
+print(set(list(big_fea[type_key])))
+
+# Y_name = ['Label']
+X = big_fea[X_name]
+Y = big_fea[Y_name]
+
+X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.3, random_state=42)
+
+sample_weight = compute_sample_weight(class_weight='balanced', y=y_train)
+model = xgb.XGBClassifier(nthread=8,
+                          learning_rate=0.08,
+                          n_estimators=1000,
+                          max_depth=10,
+                          gamma=0,
+                          subsample=0.9,
+                          colsample_bytree=0.8,
+                          verbosity=2,
+                          num_class=len(list(set(Y.values.ravel()))),
+                          tree_method='gpu_hist',
+                          grow_policy='depthwise',
+                          predictor='gpu_predictor',
+                          updater='grow_gpu_hist',
+                          )
+
+eval_set = [(X_test, y_test)]
+model.fit(X_train, y_train, sample_weight=sample_weight, eval_set=eval_set, verbose=False,
+          eval_metric=['merror', 'mlogloss'])
+results = model.evals_result()
+
+
+y_pred_test = model.predict_proba(X_test)
+best_preds = np.asarray([np.argmax(line) for line in y_pred_test])
+acc = precision_score(best_preds.reshape((-1, 1)), y_test, average='micro')
+m_acc = precision_score(best_preds.reshape((-1, 1)), y_test, average='macro')
+
+print(acc)
+print(m_acc)
+best_preds = np.asarray([np.argmax(line) for line in model.predict_proba(X_test)])
+test_y_data = pd.DataFrame(
+    np.concatenate([enc.inverse_transform(np.array(list(best_preds)).reshape(-1, 1)),
+                    enc.inverse_transform(np.array(list(y_test)).reshape(-1, 1))], axis=1))
+test_y_data.columns = ['y_pred', 'y_act']
+test_y_data.reset_index().to_feather(pred_res)
+data_table.DataTable(test_y_data)
+
+from sklearn.metrics import cohen_kappa_score
+
+cohen_kappa_score(test_y_data['y_pred'], test_y_data['y_act'])
+
+if os.path.exists(pred_res):
+    test_y_data = pd.read_feather(pred_res)
+
+y_label_meta = list(set(list(test_y_data['y_act'])))
+from google.colab import data_table
+import numpy as np
+
+
+cf = pd.DataFrame(confusion_matrix(
+    test_y_data['y_act'].values.reshape(-1, 1),
+    test_y_data['y_pred'].values.reshape(-1, 1),
+    labels=y_label_meta
+))
+cf.columns = y_label_meta
+cf.index = y_label_meta
+cf.to_excel(confusion_matrix_output)
+data_table.DataTable(cf)
+
+from sklearn.metrics import precision_recall_fscore_support
+
+pred_l = pd.DataFrame(
+    precision_recall_fscore_support(test_y_data['y_act'], test_y_data['y_pred'], labels=y_label_meta)).T
+pred_l['bldg_class'] = y_label_meta
+pred_l.columns = ['precision', 'recall', 'f1', 'support', 'bldg_class']
+pred_l.to_excel(acc_performance_output)
+data_table.DataTable(pred_l)
+
+sum(test_y_data['y_act'] == test_y_data['y_pred']) / test_y_data.shape[0]
+fea_imp_meta = pd.read_excel(feature_name_meta, sheet_name=1)
+fea_importance = pd.DataFrame(model.feature_importances_)
+fea_importance['fea_name'] = X_name
+fea_importance = pd.merge(fea_importance, fea_imp_meta, left_on='fea_name', right_on='Feature_name')
+fea_importance_g = fea_importance.groupby(['Feature_type']).agg('sum')
+data_table.DataTable(fea_importance_g)
+
+with pd.ExcelWriter(feature_importance_output) as writer:
+    fea_importance.to_excel(writer, sheet_name='raw_fea_importance')
+    fea_importance_g.to_excel(writer, sheet_name='grouped_fea_importance')
+print(X_name)
+data_table.DataTable(fea_importance_g)
